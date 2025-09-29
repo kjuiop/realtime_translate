@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"os/signal"
 	"realtime_translate/cmd/app"
+	"sync"
 	"syscall"
 )
 
@@ -14,12 +16,24 @@ var APP_VERSION = "no flag of APP_VERSION"
 
 func main() {
 
-	a := app.NewApplication()
+	wg := sync.WaitGroup{}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	a := app.NewApplication(ctx)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		a.ListenRtmp(ctx)
+	}()
 
 	slog.Debug("realtime translate app start", "git_hash", GIT_HASH, "build_time", BUILD_TIME, "app_version", APP_VERSION)
 
 	<-exitSignal()
 	a.Stop()
+	cancel()
+	wg.Wait()
+
 	slog.Debug("realtime translate app gracefully stopped")
 }
 

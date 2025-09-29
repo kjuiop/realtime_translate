@@ -36,5 +36,8 @@ build_num:
 	@echo $$(($$(cat $(BUILD_NUM_FILE)) + 1 )) > $(BUILD_NUM_FILE)
 	@echo "BUILD_NUM      : $(BUILD_NUM)"
 
+audio_stream:
+	ffmpeg -re -i espa.mp4 -vn -c:a aac -b:a 128k -ar 48000 -ac 1 -f flv rtmp://localhost:1935/live/stream
+
 test:
 	@go test ./...
