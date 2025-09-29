@@ -1,12 +1,18 @@
 package server
 
 import (
+	"bufio"
 	"context"
+	"errors"
+	"fmt"
 	"github.com/nareix/joy4/av"
+	"github.com/nareix/joy4/format/flv"
 	"github.com/nareix/joy4/format/rtmp"
+	"io"
 	"log/slog"
+	"os"
+	"os/exec"
 	"realtime_translate/config"
-	"time"
 )
 
 type RTMPServer struct {
@@ -46,9 +52,6 @@ func handlePublish(ctx context.Context, conn *rtmp.Conn, errCh chan error) {
 		_ = conn.Close()
 	}()
 
-	remote := conn.NetConn().RemoteAddr().String()
-	slog.Info("publisher connected", "remote", remote)
-
 	// 스트림(코덱) 메타데이터
 	streams, err := conn.Streams()
 	if err != nil {
@@ -56,49 +59,122 @@ func handlePublish(ctx context.Context, conn *rtmp.Conn, errCh chan error) {
 		return
 	}
 
-	// 오디오 스트림 존재 여부/코덱 정보 출력
-	audioIdx := -1
-	var audioCodec av.CodecData
-	for i, st := range streams {
+	var audioOnly []av.CodecData
+	for _, st := range streams {
 		if st.Type().IsAudio() {
-			audioIdx = i
-			audioCodec = st
-			break
+			audioOnly = append(audioOnly, st)
 		}
 	}
-	if audioIdx < 0 {
-		slog.Warn("no audio stream in RTMP publish")
+	if len(audioOnly) == 0 {
+		errCh <- errors.New("no audio streams found")
 		return
 	}
 
-	slog.Info("audio codec", "index", audioIdx, "codec", audioCodec.Type())
+	// ffmpeg: flv(stdin) → s16le 16k mono(stdout)
+	cmd := exec.CommandContext(ctx, "ffmpeg",
+		"-fflags", "nobuffer",
+		"-flags", "low_delay",
+		"-f", "flv",
+		"-i", "pipe:0",
+		"-vn",
+		"-acodec", "pcm_s16le",
+		"-ac", "1",
+		"-ar", "16000",
+		"-f", "s16le",
+		"pipe:1",
+	)
+	cmd.Stderr = os.Stderr
 
-	// 패킷 루프: 오디오 패킷만 선별
-	for {
-		select {
-		case <-ctx.Done():
-			slog.Info("rtmp publisher stopped")
-			return
-		case err := <-errCh:
-			slog.Error("rtmp publisher stopped with error", "err", err)
-			return
-		default:
-		}
-
-		pkt, err := conn.ReadPacket()
-		if err != nil {
-			slog.Error("read packet error", "err", err)
-			break
-		}
-
-		// pkt.Data 가 압축된 원시 오디오 프레임(AAC/MP3 등)
-		// pkt.Time 은 스트림 타임스탬프(상대 시간)
-		slog.Info(
-			"recv audio",
-			"bytes", len(pkt.Data),
-			"ts_ms", pkt.Time/time.Millisecond,
-			"keyframe", pkt.IsKeyFrame, // 오디오에선 의미 제한적
-		)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		errCh <- fmt.Errorf("failed to create stdin pipe: %v", err)
+		return
 	}
-	slog.Info("publisher disconnected", "remote", remote)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		errCh <- fmt.Errorf("failed to create stdout pipe: %v", err)
+		return
+	}
+
+	// FLV muxer를 ffmpeg stdin에 연결
+	mux := flv.NewMuxer(stdin)
+	if err := mux.WriteHeader(audioOnly); err != nil {
+		errCh <- fmt.Errorf("failed to write audio only: %v", err)
+		return
+	}
+
+	if err := cmd.Start(); err != nil {
+		errCh <- fmt.Errorf("failed to start ffmpeg: %v", err)
+		return
+	}
+
+	slog.Info("ffmpeg started (stdin=flv, stdout=s16le@16kHz mono)")
+
+	// RTMP 패킷 → FLV muxer 로 전송
+	pktErrCh := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				pktErrCh <- context.Canceled
+				return
+			default:
+			}
+			pkt, err := conn.ReadPacket()
+			if err != nil {
+				pktErrCh <- err
+				return
+			}
+			if err := mux.WritePacket(pkt); err != nil {
+				pktErrCh <- err
+				return
+			}
+		}
+	}()
+
+	// FFmpeg PCM 출력(20ms=640B) 읽기 고루틴
+	pcmErrCh := make(chan error, 1)
+	go func() {
+		const chunk = 640
+		r := bufio.NewReaderSize(stdout, 64*1024)
+		buf := make([]byte, chunk)
+		for {
+			if _, err := io.ReadFull(r, buf); err != nil {
+				pcmErrCh <- err
+				return
+			}
+			if err := sendToOpenAI(buf); err != nil {
+				pcmErrCh <- err
+				return
+			}
+		}
+	}()
+
+	// 종료 처리
+	var finalErr error
+	select {
+	case err := <-pcmErrCh:
+		finalErr = err
+	case err := <-pktErrCh:
+		finalErr = err
+	case <-ctx.Done():
+		finalErr = context.Canceled
+	}
+
+	// mux/ffmpeg 정리
+	_ = mux.WriteTrailer()
+	_ = stdin.Close()
+	_ = cmd.Wait()
+
+	if finalErr != nil && !errors.Is(finalErr, context.Canceled) {
+		slog.Error("pipeline stopped", "err", finalErr)
+	} else {
+		slog.Info("pipeline stopped")
+	}
+}
+
+func sendToOpenAI(pcm20ms []byte) error {
+	// TODO: 실제 업링크 구현
+	slog.Info("sending to openAI", "len", len(pcm20ms))
+	return nil
 }
